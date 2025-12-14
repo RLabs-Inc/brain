@@ -1,0 +1,16 @@
+{
+  "name": "vessel",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run build && bun run start",
+    "build": "./sveltui-build",
+    "start": "bun --conditions browser dist/src/main.mjs"
+  },
+  "dependencies": {
+    "svelte": "^5.38.7",
+    "@happy-dom/global-registrator": "^18.0.1",
+    "yoga-layout": "^3.2.1",
+    "@rlabs-inc/sveltui": "^0.1.0"
+  }
+}
