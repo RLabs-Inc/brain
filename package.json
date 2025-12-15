@@ -8,9 +8,10 @@
     "start": "bun --conditions browser dist/src/main.mjs"
   },
   "dependencies": {
-    "svelte": "^5.38.7",
+    "@frost-beta/mlx": "^0.4.0",
     "@happy-dom/global-registrator": "^18.0.1",
-    "yoga-layout": "^3.2.1",
-    "@rlabs-inc/sveltui": "^0.1.0"
+    "@rlabs-inc/sveltui": "^0.1.0",
+    "svelte": "^5.38.7",
+    "yoga-layout": "^3.2.1"
   }
 }

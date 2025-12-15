@@ -4,6 +4,7 @@
     "": {
       "name": "vessel",
       "dependencies": {
+        "@frost-beta/mlx": "^0.4.0",
         "@happy-dom/global-registrator": "^18.0.1",
         "@rlabs-inc/sveltui": "^0.1.0",
         "svelte": "^5.38.7",
@@ -12,6 +13,8 @@
     },
   },
   "packages": {
+    "@frost-beta/mlx": ["@frost-beta/mlx@0.4.0", "", {}, "sha512-8SHsV14I5PLaa55c1T1t71x+NJYLfCcgKd6Wn+KWrjL78AXPSjSBvTmjWF4SuLD8Da9J5wv7cnO0O9oYykhdFg=="],
+
     "@happy-dom/global-registrator": ["@happy-dom/global-registrator@18.0.1", "", { "dependencies": { "@types/node": "^20.0.0", "happy-dom": "^18.0.1" } }, "sha512-xCy/cpEP8xyJ6u0eokYgaQxeUmcKqHx/+aC3R0DLa7/S38efhZAVDQqLJ5zzTguLFS0gvAzZHP40NGaLwRyapQ=="],
 
     "@jridgewell/gen-mapping": ["@jridgewell/gen-mapping@0.3.13", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.0", "@jridgewell/trace-mapping": "^0.3.24" } }, "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA=="],
