@@ -25,6 +25,14 @@ import {
 } from './neuron.svelte.ts'
 
 // ============================================================================
+// CACHED CONSTANTS (avoid creating new Metal buffers every call!)
+// ============================================================================
+
+const CONST_ZERO = mx.array(0, mx.float32)
+const CONST_ONE = mx.array(1, mx.float32)
+const CONST_EPSILON = mx.array(1e-8, mx.float32)
+
+// ============================================================================
 // MOTOR TYPES
 // ============================================================================
 
@@ -218,33 +226,44 @@ export function updateSpikeWindow(motorIndex: number) {
   const size = populationSize[popIndex]
   const currentFired = fired[popIndex]
 
-  // Convert boolean to float (1.0 for spike, 0.0 for no spike)
-  const spikeFloat = mx.where(
-    currentFired,
-    mx.ones([size], mx.float32),
-    mx.zeros([size], mx.float32)
-  )
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Convert boolean to float (1.0 for spike, 0.0 for no spike)
+    const spikeFloat = mx.where(
+      currentFired,
+      mx.ones([size], mx.float32),
+      mx.zeros([size], mx.float32)
+    )
+
+    // Update fatigue: increases with activity, recovers without
+    const fatigueIncrease = mx.multiply(fatigueRate[motorIndex], spikeFloat)
+    const fatigueDecrease = mx.multiply(fatigueRecovery[motorIndex], fatigueLevel[motorIndex])
+    const newFatigue = mx.clip(
+      mx.add(mx.subtract(fatigueLevel[motorIndex], fatigueDecrease), fatigueIncrease),
+      CONST_ZERO,  // Use cached constant!
+      CONST_ONE    // Use cached constant!
+    )
+
+    mx.eval(spikeFloat, newFatigue)
+    return { spikeFloat, newFatigue }
+  })
+
+  // Update state outside tidy
+  fatigueLevel[motorIndex] = result.newFatigue
 
   // Shift window and add new spikes
   const window = spikeWindow[motorIndex]
   for (let i = window.length - 1; i > 0; i--) {
     window[i] = window[i - 1]
   }
-  window[0] = spikeFloat
-
-  // Update fatigue: increases with activity, recovers without
-  // Moved here from decodeRate to avoid side effects on read
-  const fatigueIncrease = mx.multiply(fatigueRate[motorIndex], spikeFloat)
-  const fatigueDecrease = mx.multiply(fatigueRecovery[motorIndex], fatigueLevel[motorIndex])
-  fatigueLevel[motorIndex] = mx.clip(
-    mx.add(mx.subtract(fatigueLevel[motorIndex], fatigueDecrease), fatigueIncrease),
-    mx.array(0, mx.float32),
-    mx.array(1, mx.float32)
-  )
+  window[0] = result.spikeFloat
 }
 
 /**
  * Get average spike rate over window.
+ * NOTE: This creates intermediate arrays but they're cleaned up by the
+ * calling function's mx.tidy() wrapper. The loop accumulation is unavoidable
+ * but the tidy pattern ensures proper cleanup.
  */
 function getWindowRate(motorIndex: number): ReturnType<typeof mx.array> {
   const window = spikeWindow[motorIndex]
@@ -252,14 +271,15 @@ function getWindowRate(motorIndex: number): ReturnType<typeof mx.array> {
     return mx.zeros([populationSize[motorPopulationIndex[motorIndex]]], mx.float32)
   }
 
-  // Sum all spikes in window
+  // Sum all spikes in window - intermediates cleaned by caller's tidy
   let total = window[0]
   for (let i = 1; i < window.length; i++) {
     total = mx.add(total, window[i])
   }
 
-  // Divide by window size
-  return mx.divide(total, mx.array(window.length, mx.float32))
+  // Divide by window size - use cached constant pattern
+  const winLen = mx.array(window.length, mx.float32)
+  return mx.divide(total, winLen)
 }
 
 // ============================================================================
@@ -275,44 +295,50 @@ function getWindowRate(motorIndex: number): ReturnType<typeof mx.array> {
  * @returns GPU scalar - the action magnitude
  */
 export function decodeRate(motorIndex: number): ReturnType<typeof mx.array> {
-  // Get average spike rate over window
-  const rate = getWindowRate(motorIndex)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Get average spike rate over window
+    const rate = getWindowRate(motorIndex)
 
-  // Apply fatigue: effective = rate * (1 - fatigue)
-  // NOTE: fatigue is updated in updateSpikeWindow, not here
-  const effectiveRate = mx.multiply(
-    rate,
-    mx.subtract(mx.array(1, mx.float32), fatigueLevel[motorIndex])
-  )
+    // Apply fatigue: effective = rate * (1 - fatigue) - use cached constant!
+    const effectiveRate = mx.multiply(
+      rate,
+      mx.subtract(CONST_ONE, fatigueLevel[motorIndex])
+    )
 
-  // Mean activity
-  const meanRate = mx.mean(effectiveRate)
+    // Mean activity
+    const meanRate = mx.mean(effectiveRate)
 
-  // Apply threshold
-  const thresholded = mx.maximum(
-    mx.subtract(meanRate, motorThreshold[motorIndex]),
-    mx.array(0, mx.float32)
-  )
+    // Apply threshold - use cached constant!
+    const thresholded = mx.maximum(
+      mx.subtract(meanRate, motorThreshold[motorIndex]),
+      CONST_ZERO
+    )
 
-  // Scale and bias
-  const output = mx.add(
-    mx.multiply(motorGain[motorIndex], thresholded),
-    motorBias[motorIndex]
-  )
+    // Scale and bias
+    const output = mx.add(
+      mx.multiply(motorGain[motorIndex], thresholded),
+      motorBias[motorIndex]
+    )
 
-  // Apply smoothing
+    mx.eval(output)
+    return output
+  })
+
+  // Apply smoothing (outside tidy since we need state)
   const smoothing = outputSmoothing[motorIndex].item()
   if (smoothing > 0) {
     const smoothed = mx.add(
       mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
-      mx.multiply(mx.array(1 - smoothing, mx.float32), output)
+      mx.multiply(mx.array(1 - smoothing, mx.float32), result)
     )
+    mx.eval(smoothed)
     lastOutput[motorIndex] = smoothed
     return smoothed
   }
 
-  lastOutput[motorIndex] = mx.reshape(output, [1])
-  return output
+  lastOutput[motorIndex] = mx.reshape(result, [1])
+  return result
 }
 
 /**
@@ -328,42 +354,48 @@ export function decodePopulation(
   motorIndex: number,
   preferredValues: ReturnType<typeof mx.array>
 ): ReturnType<typeof mx.array> {
-  // Get spike rates
-  const rate = getWindowRate(motorIndex)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Get spike rates
+    const rate = getWindowRate(motorIndex)
 
-  // Apply fatigue (updated in updateSpikeWindow, not here)
-  const effectiveRate = mx.multiply(
-    rate,
-    mx.subtract(mx.array(1, mx.float32), fatigueLevel[motorIndex])
-  )
+    // Apply fatigue - use cached constant!
+    const effectiveRate = mx.multiply(
+      rate,
+      mx.subtract(CONST_ONE, fatigueLevel[motorIndex])
+    )
 
-  // Weighted average: sum(rate * value) / sum(rate)
-  const totalActivity = mx.sum(effectiveRate)
-  const weightedSum = mx.sum(mx.multiply(effectiveRate, preferredValues))
+    // Weighted average: sum(rate * value) / sum(rate)
+    const totalActivity = mx.sum(effectiveRate)
+    const weightedSum = mx.sum(mx.multiply(effectiveRate, preferredValues))
 
-  // Avoid division by zero
-  const epsilon = mx.array(1e-8, mx.float32)
-  const decoded = mx.divide(weightedSum, mx.add(totalActivity, epsilon))
+    // Avoid division by zero - use cached constant!
+    const decoded = mx.divide(weightedSum, mx.add(totalActivity, CONST_EPSILON))
 
-  // Apply gain and bias
-  const output = mx.add(
-    mx.multiply(motorGain[motorIndex], decoded),
-    motorBias[motorIndex]
-  )
+    // Apply gain and bias
+    const output = mx.add(
+      mx.multiply(motorGain[motorIndex], decoded),
+      motorBias[motorIndex]
+    )
 
-  // Apply smoothing
+    mx.eval(output)
+    return output
+  })
+
+  // Apply smoothing (outside tidy since we need state)
   const smoothing = outputSmoothing[motorIndex].item()
   if (smoothing > 0) {
     const smoothed = mx.add(
       mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
-      mx.multiply(mx.array(1 - smoothing, mx.float32), output)
+      mx.multiply(mx.array(1 - smoothing, mx.float32), result)
     )
+    mx.eval(smoothed)
     lastOutput[motorIndex] = smoothed
     return smoothed
   }
 
-  lastOutput[motorIndex] = mx.reshape(output, [1])
-  return output
+  lastOutput[motorIndex] = mx.reshape(result, [1])
+  return result
 }
 
 /**
@@ -374,31 +406,37 @@ export function decodePopulation(
  * @returns GPU scalar - index of winning neuron (or -1 if below threshold)
  */
 export function decodeWinnerTakeAll(motorIndex: number): ReturnType<typeof mx.array> {
-  // Get spike rates
-  const rate = getWindowRate(motorIndex)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Get spike rates
+    const rate = getWindowRate(motorIndex)
 
-  // Apply fatigue (updated in updateSpikeWindow, not here)
-  const effectiveRate = mx.multiply(
-    rate,
-    mx.subtract(mx.array(1, mx.float32), fatigueLevel[motorIndex])
-  )
+    // Apply fatigue - use cached constant!
+    const effectiveRate = mx.multiply(
+      rate,
+      mx.subtract(CONST_ONE, fatigueLevel[motorIndex])
+    )
 
-  // Find max
-  const maxRate = mx.max(effectiveRate)
+    // Find max
+    const maxRate = mx.max(effectiveRate)
 
-  // Check threshold
-  const threshold = motorThreshold[motorIndex]
-  const aboveThreshold = mx.greater(maxRate, threshold)
+    // Check threshold
+    const threshold = motorThreshold[motorIndex]
+    const aboveThreshold = mx.greater(maxRate, threshold)
 
-  // Get argmax
-  const winner = mx.argmax(effectiveRate)
+    // Get argmax
+    const winner = mx.argmax(effectiveRate)
 
-  // Return winner if above threshold, -1 otherwise
-  const result = mx.where(
-    aboveThreshold,
-    winner,
-    mx.array(-1, mx.int32)
-  )
+    // Return winner if above threshold, -1 otherwise
+    const output = mx.where(
+      aboveThreshold,
+      winner,
+      mx.array(-1, mx.int32)
+    )
+
+    mx.eval(output)
+    return output
+  })
 
   lastOutput[motorIndex] = mx.array([result.item()], mx.float32)
   return result
@@ -412,40 +450,47 @@ export function decodeWinnerTakeAll(motorIndex: number): ReturnType<typeof mx.ar
  * @returns GPU array - one value per neuron
  */
 export function decodeLabeledLine(motorIndex: number): ReturnType<typeof mx.array> {
-  // Get spike rates
-  const rate = getWindowRate(motorIndex)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Get spike rates
+    const rate = getWindowRate(motorIndex)
 
-  // Apply fatigue (updated in updateSpikeWindow, not here)
-  const effectiveRate = mx.multiply(
-    rate,
-    mx.subtract(mx.array(1, mx.float32), fatigueLevel[motorIndex])
-  )
+    // Apply fatigue - use cached constant!
+    const effectiveRate = mx.multiply(
+      rate,
+      mx.subtract(CONST_ONE, fatigueLevel[motorIndex])
+    )
 
-  // Apply threshold
-  const thresholded = mx.maximum(
-    mx.subtract(effectiveRate, motorThreshold[motorIndex]),
-    mx.zeros([populationSize[motorPopulationIndex[motorIndex]]], mx.float32)
-  )
+    // Apply threshold
+    const thresholded = mx.maximum(
+      mx.subtract(effectiveRate, motorThreshold[motorIndex]),
+      mx.zeros([populationSize[motorPopulationIndex[motorIndex]]], mx.float32)
+    )
 
-  // Scale and bias
-  const output = mx.add(
-    mx.multiply(motorGain[motorIndex], thresholded),
-    motorBias[motorIndex]
-  )
+    // Scale and bias
+    const output = mx.add(
+      mx.multiply(motorGain[motorIndex], thresholded),
+      motorBias[motorIndex]
+    )
 
-  // Apply smoothing (element-wise)
+    mx.eval(output)
+    return output
+  })
+
+  // Apply smoothing (element-wise) - outside tidy since we need state
   const smoothing = outputSmoothing[motorIndex].item()
   if (smoothing > 0) {
     const smoothed = mx.add(
       mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
-      mx.multiply(mx.array(1 - smoothing, mx.float32), output)
+      mx.multiply(mx.array(1 - smoothing, mx.float32), result)
     )
+    mx.eval(smoothed)
     lastOutput[motorIndex] = smoothed
     return smoothed
   }
 
-  lastOutput[motorIndex] = output
-  return output
+  lastOutput[motorIndex] = result
+  return result
 }
 
 // ============================================================================

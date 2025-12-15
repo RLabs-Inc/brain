@@ -25,6 +25,7 @@ import {
   registry as neuronRegistry,
   populationSize,
   voltage,
+  recovery,
   current,
   fired,
   integrate,
@@ -34,6 +35,19 @@ import {
   isExcitatory,
   THRESHOLD,
 } from './neuron.svelte.ts'
+
+// ============================================================================
+// CACHED CONSTANTS (avoid creating new Metal buffers every call!)
+// ============================================================================
+
+const CONST_ZERO_F32 = mx.array(0, mx.float32)
+const CONST_ZERO_I32 = mx.array(0, mx.int32)
+const CONST_ONE_F32 = mx.array(1, mx.float32)
+const CONST_ONE_I32 = mx.array(1, mx.int32)
+const CONST_EPSILON = mx.array(1e-8, mx.float32)
+const CONST_REWARD_THRESHOLD = mx.array(0.001, mx.float32)
+const CONST_SCALE_MIN = mx.array(0.5, mx.float32)
+const CONST_SCALE_MAX = mx.array(2.0, mx.float32)
 import {
   registry as synapseRegistry,
   groupPrePopIndex,
@@ -275,10 +289,14 @@ export function step(networkIndex: number, dt: number = 1.0) {
     rewardSignal = dopamine[networkIndex]
   }
 
-  // Check if there's any reward signal (GPU comparison)
-  const hasReward = mx.greater(mx.abs(rewardSignal), mx.array(0.001))
-  mx.eval(hasReward)
-  if (hasReward.item()) {
+  // Check if there's any reward signal - wrap in tidy to clean up intermediate
+  const shouldApplyReward = mx.tidy(() => {
+    const hasReward = mx.greater(mx.abs(rewardSignal), CONST_REWARD_THRESHOLD)
+    mx.eval(hasReward)
+    return hasReward
+  })
+
+  if (shouldApplyReward.item()) {
     for (const groupIndex of groups) {
       applyReward(groupIndex, rewardSignal)
     }
@@ -308,8 +326,19 @@ export function step(networkIndex: number, dt: number = 1.0) {
     decayModulatorsById(networkId!)
   }
 
-  // 9. Increment timestep (GPU add)
-  timestep[networkIndex] = mx.add(timestep[networkIndex], mx.array(1, mx.int32))
+  // 9. Increment timestep (GPU add) - use cached constant!
+  timestep[networkIndex] = mx.add(timestep[networkIndex], CONST_ONE_I32)
+
+  // 10. CRITICAL: Force evaluation to release intermediate tensors
+  // Without this, MLX accumulates lazy operations and runs out of tracked resources
+  // This synchronizes GPU computation and allows memory to be freed
+  const evalTargets: any[] = []
+  for (const popIndex of pops) {
+    evalTargets.push(voltage[popIndex], recovery[popIndex], current[popIndex], fired[popIndex])
+  }
+  if (evalTargets.length > 0) {
+    mx.eval(...evalTargets)
+  }
 }
 
 /**
@@ -388,20 +417,26 @@ export async function evaluate(networkIndex: number) {
 function updateEIBalance(networkIndex: number) {
   const pops = networkPopulations[networkIndex]
 
-  let excSpikes = mx.array(0, mx.float32)
-  let inhSpikes = mx.array(0, mx.float32)
+  // Use mx.tidy to clean up intermediate tensors from the loop
+  const result = mx.tidy(() => {
+    let excSpikes = CONST_ZERO_F32
+    let inhSpikes = CONST_ZERO_F32
 
-  for (const popIndex of pops) {
-    const spikeCount = mx.sum(fired[popIndex])
-    if (isExcitatory[popIndex]) {
-      excSpikes = mx.add(excSpikes, spikeCount)
-    } else {
-      inhSpikes = mx.add(inhSpikes, spikeCount)
+    for (const popIndex of pops) {
+      const spikeCount = mx.sum(fired[popIndex])
+      if (isExcitatory[popIndex]) {
+        excSpikes = mx.add(excSpikes, spikeCount)
+      } else {
+        inhSpikes = mx.add(inhSpikes, spikeCount)
+      }
     }
-  }
 
-  excitatorySpikeCount[networkIndex] = excSpikes
-  inhibitorySpikeCount[networkIndex] = inhSpikes
+    mx.eval(excSpikes, inhSpikes)
+    return { excSpikes, inhSpikes }
+  })
+
+  excitatorySpikeCount[networkIndex] = result.excSpikes
+  inhibitorySpikeCount[networkIndex] = result.inhSpikes
 }
 
 /**
@@ -414,9 +449,8 @@ export function getEIRatio(networkIndex: number): ReturnType<typeof mx.array> {
   const inh = inhibitorySpikeCount[networkIndex]
   const total = mx.add(exc, inh)
 
-  // Avoid division by zero
-  const epsilon = mx.array(1e-8, mx.float32)
-  return mx.divide(exc, mx.add(total, epsilon))
+  // Avoid division by zero - use cached constant!
+  return mx.divide(exc, mx.add(total, CONST_EPSILON))
 }
 
 /**
@@ -474,40 +508,58 @@ function applyHomeostasis(networkIndex: number) {
 
   const target = targetFiringRate[networkIndex]
   const tau = homeostaticTau[networkIndex]
-  const learningRate = mx.divide(mx.array(1, mx.float32), tau)
+
+  // Use mx.tidy to clean up all intermediate tensors
+  const newAvgRates: ReturnType<typeof mx.array>[] = []
+  const newScales: ReturnType<typeof mx.array>[] = []
 
   // Update running average firing rate for each population
   for (let i = 0; i < pops.length; i++) {
     const popIndex = pops[i]
     const size = populationSize[popIndex]
 
-    // Current instantaneous firing rate
-    const firedFloat = mx.where(
-      fired[popIndex],
-      mx.ones([size], mx.float32),
-      mx.zeros([size], mx.float32)
-    )
+    const result = mx.tidy(() => {
+      // Learning rate
+      const learningRate = mx.divide(CONST_ONE_F32, tau)
 
-    // Exponential moving average
-    const alpha = learningRate
-    const oneMinusAlpha = mx.subtract(mx.array(1, mx.float32), alpha)
-    avgFiringRate[networkIndex][i] = mx.add(
-      mx.multiply(oneMinusAlpha, avgFiringRate[networkIndex][i]),
-      mx.multiply(alpha, firedFloat)
-    )
+      // Current instantaneous firing rate
+      const firedFloat = mx.where(
+        fired[popIndex],
+        mx.ones([size], mx.float32),
+        mx.zeros([size], mx.float32)
+      )
 
-    // Compute scaling factor: target / actual
-    const avg = avgFiringRate[networkIndex][i]
-    const epsilon = mx.array(1e-8, mx.float32)
-    const scale = mx.divide(target, mx.add(mx.mean(avg), epsilon))
+      // Exponential moving average - use cached constants!
+      const alpha = learningRate
+      const oneMinusAlpha = mx.subtract(CONST_ONE_F32, alpha)
+      const newAvg = mx.add(
+        mx.multiply(oneMinusAlpha, avgFiringRate[networkIndex][i]),
+        mx.multiply(alpha, firedFloat)
+      )
 
-    // Clamp scale to prevent runaway
-    const clampedScale = mx.clip(scale, mx.array(0.5), mx.array(2.0))
+      // Compute scaling factor: target / actual - use cached epsilon!
+      const scale = mx.divide(target, mx.add(mx.mean(newAvg), CONST_EPSILON))
 
-    homeostaticScale[networkIndex][i] = mx.multiply(
-      homeostaticScale[networkIndex][i],
-      mx.power(clampedScale, learningRate)  // Gradual adjustment
-    )
+      // Clamp scale to prevent runaway - use cached constants!
+      const clampedScale = mx.clip(scale, CONST_SCALE_MIN, CONST_SCALE_MAX)
+
+      const newScale = mx.multiply(
+        homeostaticScale[networkIndex][i],
+        mx.power(clampedScale, learningRate)  // Gradual adjustment
+      )
+
+      mx.eval(newAvg, newScale)
+      return { newAvg, newScale }
+    })
+
+    newAvgRates.push(result.newAvg)
+    newScales.push(result.newScale)
+  }
+
+  // Update state arrays
+  for (let i = 0; i < pops.length; i++) {
+    avgFiringRate[networkIndex][i] = newAvgRates[i]
+    homeostaticScale[networkIndex][i] = newScales[i]
   }
 
   // Apply scaling to incoming synapses of each population
@@ -518,17 +570,23 @@ function applyHomeostasis(networkIndex: number) {
     const localIndex = pops.indexOf(postPopIndex)
     if (localIndex < 0) continue
 
-    // Scale weights by homeostatic factor
-    // We apply the mean scale factor to all incoming weights
-    const scale = mx.mean(homeostaticScale[networkIndex][localIndex])
+    // Use mx.tidy for the weight scaling
+    const newWeights = mx.tidy(() => {
+      // Scale weights by homeostatic factor
+      const scale = mx.mean(homeostaticScale[networkIndex][localIndex])
 
-    // Multiply weights by scale, keeping them within bounds
-    const scaledWeights = mx.multiply(groupWeights[groupIndex], scale)
-    groupWeights[groupIndex] = mx.clip(
-      scaledWeights,
-      groupMinWeight[groupIndex],
-      groupMaxWeight[groupIndex]
-    )
+      // Multiply weights by scale, keeping them within bounds
+      const scaledWeights = mx.multiply(groupWeights[groupIndex], scale)
+      const clipped = mx.clip(
+        scaledWeights,
+        groupMinWeight[groupIndex],
+        groupMaxWeight[groupIndex]
+      )
+      mx.eval(clipped)
+      return clipped
+    })
+
+    groupWeights[groupIndex] = newWeights
   }
 }
 

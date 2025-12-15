@@ -63,6 +63,9 @@ export function createNavigationSuite(): Suite {
       console.log(`Expected: ${experiment.expectedOutcome}`)
       console.log('='.repeat(60))
 
+      // Setup the experiment (creates creature and world)
+      experiment.setup()
+
       const result = await experiment.run(timestepsPerExperiment)
       results.set(experiment.name, result)
 

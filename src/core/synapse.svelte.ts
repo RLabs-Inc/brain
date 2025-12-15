@@ -29,6 +29,18 @@ import {
 } from './neuron.svelte.ts'
 
 // ============================================================================
+// CACHED CONSTANTS (avoid creating new Metal buffers every call!)
+// ============================================================================
+// MLX arrays are lazy and each mx.array() allocates a Metal buffer.
+// Creating constants repeatedly in tight loops exhausts GPU resources.
+
+const CONST_ZERO = mx.array(0.0, mx.float32)
+const CONST_ONE = mx.array(1.0, mx.float32)
+const CONST_HALF = mx.array(0.5, mx.float32)
+const CONST_TRACE_DECAY = mx.array(0.95, mx.float32)
+const CONST_ELIG_DECAY = mx.array(0.5, mx.float32)
+
+// ============================================================================
 // SYNAPSE TYPES (for more biologically accurate transmission)
 // ============================================================================
 
@@ -281,24 +293,32 @@ export function transmit(groupIndex: number) {
   const prePopIndex = groupPrePopIndex[groupIndex]
   const postPopIndex = groupPostPopIndex[groupIndex]
 
-  // Use the fired state from last integration (not voltage comparison)
-  const preFiring = fired[prePopIndex]
+  // Use mx.tidy to clean up intermediate tensors
+  const newCurrent = mx.tidy(() => {
+    // Use the fired state from last integration (not voltage comparison)
+    const preFiring = fired[prePopIndex]
 
-  // Get which synapses have a firing pre-neuron (GPU indexing)
-  const synapseActive = preFiring.index(preIndices[groupIndex])
+    // Get which synapses have a firing pre-neuron (GPU indexing)
+    const synapseActive = preFiring.index(preIndices[groupIndex])
 
-  // Compute contribution (weight if active, 0 otherwise) - GPU where
-  const contribution = mx.where(
-    synapseActive,
-    weights[groupIndex],
-    mx.zerosLike(weights[groupIndex])
-  )
+    // Compute contribution (weight if active, 0 otherwise) - GPU where
+    const contribution = mx.where(
+      synapseActive,
+      weights[groupIndex],
+      mx.zerosLike(weights[groupIndex])
+    )
 
-  // Copy postIndices to avoid corruption from scatter-add (node-mlx bug workaround)
-  const postIdxCopy = mx.array(postIndices[groupIndex])
+    // Copy postIndices to avoid corruption from scatter-add (node-mlx bug workaround)
+    const postIdxCopy = mx.array(postIndices[groupIndex])
 
-  // Scatter-add to post-synaptic neurons - THE KEY OPERATION!
-  current[postPopIndex] = current[postPopIndex].at(postIdxCopy).add(contribution)
+    // Scatter-add to post-synaptic neurons - THE KEY OPERATION!
+    const result = current[postPopIndex].at(postIdxCopy).add(contribution)
+
+    mx.eval(result)
+    return result
+  })
+
+  current[postPopIndex] = newCurrent
 }
 
 /**
@@ -313,25 +333,34 @@ export function updateTraces(groupIndex: number) {
   const prePopIndex = groupPrePopIndex[groupIndex]
   const postPopIndex = groupPostPopIndex[groupIndex]
 
-  // Use the fired state from last integration
-  const preFiring = fired[prePopIndex]
-  const postFiring = fired[postPopIndex]
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Use the fired state from last integration
+    const preFiring = fired[prePopIndex]
+    const postFiring = fired[postPopIndex]
 
-  // Decay traces (GPU multiply with pre-computed decay factors)
-  preTrace[groupIndex] = mx.multiply(preTrace[groupIndex], decayPlus[groupIndex])
-  postTrace[groupIndex] = mx.multiply(postTrace[groupIndex], decayMinus[groupIndex])
+    // Decay traces (GPU multiply with pre-computed decay factors)
+    let newPreTrace = mx.multiply(preTrace[groupIndex], decayPlus[groupIndex])
+    let newPostTrace = mx.multiply(postTrace[groupIndex], decayMinus[groupIndex])
 
-  // Increment traces for firing neurons (GPU where)
-  preTrace[groupIndex] = mx.where(
-    preFiring,
-    mx.add(preTrace[groupIndex], mx.array(1.0)),
-    preTrace[groupIndex]
-  )
-  postTrace[groupIndex] = mx.where(
-    postFiring,
-    mx.add(postTrace[groupIndex], mx.array(1.0)),
-    postTrace[groupIndex]
-  )
+    // Increment traces for firing neurons (GPU where) - use cached constants!
+    newPreTrace = mx.where(
+      preFiring,
+      mx.add(newPreTrace, CONST_ONE),
+      newPreTrace
+    )
+    newPostTrace = mx.where(
+      postFiring,
+      mx.add(newPostTrace, CONST_ONE),
+      newPostTrace
+    )
+
+    mx.eval(newPreTrace, newPostTrace)
+    return { newPreTrace, newPostTrace }
+  })
+
+  preTrace[groupIndex] = result.newPreTrace
+  postTrace[groupIndex] = result.newPostTrace
 }
 
 /**
@@ -347,46 +376,58 @@ export function applySTDP(groupIndex: number, directUpdate: boolean = false) {
   const prePopIndex = groupPrePopIndex[groupIndex]
   const postPopIndex = groupPostPopIndex[groupIndex]
 
-  // Use the fired state from last integration
-  const preFiring = fired[prePopIndex]
-  const postFiring = fired[postPopIndex]
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Use the fired state from last integration
+    const preFiring = fired[prePopIndex]
+    const postFiring = fired[postPopIndex]
 
-  // Get traces at synapse locations (GPU indexing)
-  const preTraceAtSyn = preTrace[groupIndex].index(preIndices[groupIndex])
-  const postTraceAtSyn = postTrace[groupIndex].index(postIndices[groupIndex])
+    // Get traces at synapse locations (GPU indexing)
+    const preTraceAtSyn = preTrace[groupIndex].index(preIndices[groupIndex])
+    const postTraceAtSyn = postTrace[groupIndex].index(postIndices[groupIndex])
 
-  // Get firing at synapse locations (GPU indexing)
-  const preFiredAtSyn = preFiring.index(preIndices[groupIndex])
-  const postFiredAtSyn = postFiring.index(postIndices[groupIndex])
+    // Get firing at synapse locations (GPU indexing)
+    const preFiredAtSyn = preFiring.index(preIndices[groupIndex])
+    const postFiredAtSyn = postFiring.index(postIndices[groupIndex])
 
-  // LTP: Post fires AND pre was recently active (GPU where)
-  const ltp = mx.where(
-    postFiredAtSyn,
-    mx.multiply(stdpAPlus[groupIndex], preTraceAtSyn),
-    mx.zerosLike(weights[groupIndex])
-  )
-
-  // LTD: Pre fires AND post was recently active (GPU where)
-  const ltd = mx.where(
-    preFiredAtSyn,
-    mx.multiply(mx.negative(stdpAMinus[groupIndex]), postTraceAtSyn),
-    mx.zerosLike(weights[groupIndex])
-  )
-
-  // Update eligibility trace (GPU)
-  const dw = mx.add(ltp, ltd)
-  eligibility[groupIndex] = mx.add(
-    mx.multiply(eligibility[groupIndex], mx.array(0.95)),
-    dw
-  )
-
-  // Optionally apply directly to weights
-  if (directUpdate) {
-    weights[groupIndex] = mx.clip(
-      mx.add(weights[groupIndex], dw),
-      minWeight[groupIndex],
-      maxWeight[groupIndex]
+    // LTP: Post fires AND pre was recently active (GPU where)
+    const ltp = mx.where(
+      postFiredAtSyn,
+      mx.multiply(stdpAPlus[groupIndex], preTraceAtSyn),
+      mx.zerosLike(weights[groupIndex])
     )
+
+    // LTD: Pre fires AND post was recently active (GPU where)
+    const ltd = mx.where(
+      preFiredAtSyn,
+      mx.multiply(mx.negative(stdpAMinus[groupIndex]), postTraceAtSyn),
+      mx.zerosLike(weights[groupIndex])
+    )
+
+    // Update eligibility trace (GPU) - use cached constants!
+    const dw = mx.add(ltp, ltd)
+    const newEligibility = mx.add(
+      mx.multiply(eligibility[groupIndex], CONST_TRACE_DECAY),
+      dw
+    )
+
+    // Optionally apply directly to weights
+    let newWeights = weights[groupIndex]
+    if (directUpdate) {
+      newWeights = mx.clip(
+        mx.add(weights[groupIndex], dw),
+        minWeight[groupIndex],
+        maxWeight[groupIndex]
+      )
+    }
+
+    mx.eval(newEligibility, newWeights)
+    return { newEligibility, newWeights, didUpdate: directUpdate }
+  })
+
+  eligibility[groupIndex] = result.newEligibility
+  if (result.didUpdate) {
+    weights[groupIndex] = result.newWeights
   }
 }
 
@@ -395,18 +436,27 @@ export function applySTDP(groupIndex: number, directUpdate: boolean = false) {
  * ALL GPU operations.
  */
 export function applyReward(groupIndex: number, reward: ReturnType<typeof mx.array>) {
-  // Modulate weight change by reward (GPU multiply)
-  const dw = mx.multiply(eligibility[groupIndex], reward)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Modulate weight change by reward (GPU multiply)
+    const dw = mx.multiply(eligibility[groupIndex], reward)
 
-  // Apply and clip (GPU)
-  weights[groupIndex] = mx.clip(
-    mx.add(weights[groupIndex], dw),
-    minWeight[groupIndex],
-    maxWeight[groupIndex]
-  )
+    // Apply and clip (GPU)
+    const newWeights = mx.clip(
+      mx.add(weights[groupIndex], dw),
+      minWeight[groupIndex],
+      maxWeight[groupIndex]
+    )
 
-  // Decay eligibility (GPU)
-  eligibility[groupIndex] = mx.multiply(eligibility[groupIndex], mx.array(0.5))
+    // Decay eligibility (GPU) - use cached constants!
+    const newEligibility = mx.multiply(eligibility[groupIndex], CONST_ELIG_DECAY)
+
+    mx.eval(newWeights, newEligibility)
+    return { newWeights, newEligibility }
+  })
+
+  weights[groupIndex] = result.newWeights
+  eligibility[groupIndex] = result.newEligibility
 }
 
 /**

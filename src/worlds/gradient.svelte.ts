@@ -96,6 +96,10 @@ export function createGradient(id: string, options: GradientWorldOptions = {}): 
   // Track cumulative rewards for analysis
   const cumulativeRewards = $state(new SvelteMap<string, number>())
 
+  // Track previous concentration for temporal comparison (klinokinesis)
+  // This is KEY for real chemotaxis - "am I getting closer?"
+  const previousConcentration = $state(new SvelteMap<string, number>())
+
   // ============================================================================
   // HELPER FUNCTIONS
   // ============================================================================
@@ -143,11 +147,14 @@ export function createGradient(id: string, options: GradientWorldOptions = {}): 
       velocity: { vx: 0, vy: 0, angular: 0 }
     })
     cumulativeRewards.set(creature.id, 0)
+    // Initialize previous concentration for temporal sensing
+    previousConcentration.set(creature.id, getConcentration(position.x, position.y))
   }
 
   function removeCreature(creature: Creature): void {
     creatures.delete(creature.id)
     cumulativeRewards.delete(creature.id)
+    previousConcentration.delete(creature.id)
   }
 
   function getPosition(creature: Creature): Position | undefined {
@@ -166,6 +173,14 @@ export function createGradient(id: string, options: GradientWorldOptions = {}): 
 
     // Current concentration at creature's position
     const concentration = getConcentration(x, y)
+
+    // TEMPORAL COMPARISON - The key to real chemotaxis!
+    // "Am I getting warmer or colder?"
+    const prevConc = previousConcentration.get(creature.id) ?? concentration
+    const concentrationDelta = concentration - prevConc  // Positive = getting closer!
+
+    // Update previous concentration for next timestep
+    previousConcentration.set(creature.id, concentration)
 
     // Gradient direction (for sensors that can detect direction)
     const gradientDir = getGradientDirection(x, y)
@@ -188,7 +203,7 @@ export function createGradient(id: string, options: GradientWorldOptions = {}): 
     const forwardY = y + lookAhead * Math.sin(currentHeading)
     const forwardConcentration = getConcentration(forwardX, forwardY)
 
-    // Concentration change (are we moving toward or away from food?)
+    // Concentration change in heading direction
     const concentrationChange = forwardConcentration - concentration
 
     return new Map([
@@ -196,7 +211,13 @@ export function createGradient(id: string, options: GradientWorldOptions = {}): 
       ['chemical_left', Math.max(0, sensorAsymmetry)],   // Left sensor
       ['chemical_right', Math.max(0, -sensorAsymmetry)], // Right sensor
       ['gradient_strength', Math.abs(concentrationChange)], // How strong is the gradient here?
-      ['improving', concentrationChange > 0 ? 1 : 0]  // Are we heading toward food?
+      ['improving', concentrationChange > 0 ? 1 : 0],  // Are we heading toward food?
+
+      // NEW: Temporal derivative signals - THE KEY TO REAL CHEMOTAXIS
+      // These tell the creature "am I getting warmer or colder?"
+      ['concentration_increasing', Math.max(0, concentrationDelta * 10)],  // Getting closer! (amplified)
+      ['concentration_decreasing', Math.max(0, -concentrationDelta * 10)], // Getting farther! (amplified)
+      ['concentration_delta', concentrationDelta],     // Raw delta (can be negative)
     ])
   }
 

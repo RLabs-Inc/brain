@@ -23,6 +23,17 @@ import { core as mx } from '@frost-beta/mlx'
 import { SvelteMap } from 'svelte/reactivity'
 
 // ============================================================================
+// CACHED CONSTANTS (avoid creating new Metal buffers every call!)
+// ============================================================================
+// MLX arrays are lazy and each mx.array() allocates a Metal buffer.
+// Creating constants repeatedly in tight loops exhausts GPU resources.
+
+const THRESHOLD_CONST = mx.array(30, mx.float32)  // Spike threshold
+const IZH_004 = mx.array(0.04, mx.float32)        // Izhikevich v² coefficient
+const IZH_5 = mx.array(5, mx.float32)             // Izhikevich v coefficient
+const IZH_140 = mx.array(140, mx.float32)         // Izhikevich constant
+
+// ============================================================================
 // NEURON TYPE PRESETS (Izhikevich parameters from original 2003 paper)
 // ============================================================================
 
@@ -268,57 +279,68 @@ export function injectUniformCurrent(popIndex: number, value: number) {
  * @param injectNoise - Whether to inject background noise (default true)
  */
 export function integrate(popIndex: number, dt: number = 1.0, injectNoise: boolean = true) {
-  let v = voltage[popIndex]
-  let u = recovery[popIndex]
   const size = populationSize[popIndex]
 
-  // Get synaptic current + optional background noise (ALL GPU)
-  let I = current[popIndex]
-  if (injectNoise) {
-    // Gaussian noise with amplitude ~5 (biologically realistic thalamic input)
-    const noise = mx.multiply(
-      noiseAmplitude[popIndex],
-      mx.random.normal([size])
-    )
-    I = mx.add(I, noise)
-  }
+  // Use mx.tidy to clean up ALL intermediate tensors - only keep the returned values!
+  const result = mx.tidy(() => {
+    let v = voltage[popIndex]
+    let u = recovery[popIndex]
 
-  const a = paramA[popIndex]
-  const b = paramB[popIndex]
-  const c = paramC[popIndex]
-  const d = paramD[popIndex]
+    // Get synaptic current + optional background noise (ALL GPU)
+    let I = current[popIndex]
+    if (injectNoise) {
+      // Gaussian noise with amplitude ~5 (biologically realistic thalamic input)
+      const noise = mx.multiply(
+        noiseAmplitude[popIndex],
+        mx.random.normal([size])
+      )
+      I = mx.add(I, noise)
+    }
 
-  // Track any spikes across all sub-steps
-  let anyFired = mx.zeros([size], mx.bool_)
+    const a = paramA[popIndex]
+    const b = paramB[popIndex]
+    const c = paramC[popIndex]
+    const d = paramD[popIndex]
 
-  // Sub-stepping for numerical stability (4 steps of 0.25ms)
-  const subDt = dt / 4
-  for (let i = 0; i < 4; i++) {
-    // Izhikevich equations
-    // dv/dt = 0.04v² + 5v + 140 - u + I
-    const dv = mx.add(
-      mx.multiply(0.04, mx.square(v)),
-      mx.add(mx.multiply(5, v), mx.add(140, mx.subtract(I, u)))
-    )
+    // Track any spikes across all sub-steps
+    let anyFired = mx.zeros([size], mx.bool_)
 
-    // du/dt = a(bv - u)
-    const du = mx.multiply(a, mx.subtract(mx.multiply(b, v), u))
+    // Sub-stepping for numerical stability (4 steps of 0.25ms)
+    // Using cached constants to avoid creating new Metal buffers each iteration
+    const subDt = dt / 4
+    for (let i = 0; i < 4; i++) {
+      // Izhikevich equations
+      // dv/dt = 0.04v² + 5v + 140 - u + I
+      const dv = mx.add(
+        mx.multiply(IZH_004, mx.square(v)),
+        mx.add(mx.multiply(IZH_5, v), mx.add(IZH_140, mx.subtract(I, u)))
+      )
 
-    // Euler integration for this sub-step
-    v = mx.add(v, mx.multiply(dv, subDt))
-    u = mx.add(u, mx.multiply(du, subDt))
+      // du/dt = a(bv - u)
+      const du = mx.multiply(a, mx.subtract(mx.multiply(b, v), u))
 
-    // Check for spikes within sub-step and reset
-    const spikeMask = mx.greaterEqual(v, mx.array(THRESHOLD))
-    anyFired = mx.logicalOr(anyFired, spikeMask)  // Track all spikes
-    v = mx.where(spikeMask, c, v)
-    u = mx.where(spikeMask, mx.add(u, d), u)
-  }
+      // Euler integration for this sub-step
+      v = mx.add(v, mx.multiply(dv, subDt))
+      u = mx.add(u, mx.multiply(du, subDt))
 
-  // Store final values
-  voltage[popIndex] = v
-  recovery[popIndex] = u
-  fired[popIndex] = anyFired  // Store which neurons fired this timestep
+      // Check for spikes within sub-step and reset - use cached threshold!
+      const spikeMask = mx.greaterEqual(v, THRESHOLD_CONST)
+      anyFired = mx.logicalOr(anyFired, spikeMask)  // Track all spikes
+      v = mx.where(spikeMask, c, v)
+      u = mx.where(spikeMask, mx.add(u, d), u)
+    }
+
+    // Evaluate before returning to ensure arrays are materialized
+    mx.eval(v, u, anyFired)
+
+    // Return only what we need - everything else gets disposed!
+    return { v, u, anyFired }
+  })
+
+  // Store final values (these survived tidy because they were returned)
+  voltage[popIndex] = result.v
+  recovery[popIndex] = result.u
+  fired[popIndex] = result.anyFired
 
   // Clear current for next timestep
   current[popIndex] = mx.zeros([size], mx.float32)

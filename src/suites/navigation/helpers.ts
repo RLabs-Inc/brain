@@ -13,6 +13,7 @@ import type { Creature, CreatureState, CreatureOptions } from '../../creatures/t
 import {
   allocatePopulation,
   releasePopulation,
+  injectCurrent,
   voltage,
   fired,
   populationSize,
@@ -40,6 +41,7 @@ import {
   allocateMotor,
   releaseMotor,
   decodeAction,
+  updateSpikeWindow,
 } from '../../core/motor.svelte.ts'
 
 // ============================================================================
@@ -144,18 +146,20 @@ export function createRandomWorm(id: string, options: CreatureOptions = {}): Cre
     encoding: 'rate',
   })
 
-  // Motors
+  // Motors - same gains as innate worm for fair comparison
   const forwardMotor = allocateMotor(`${id}_motor_forward`, forwardPop, {
     type: 'locomotion',
     decoding: 'rate',
     actionName: 'forward',
-    gain: 1.0,
+    gain: 50.0,
+    smoothing: 0.3,
   })
   const turnMotor = allocateMotor(`${id}_motor_turn`, turnPop, {
     type: 'locomotion',
     decoding: 'rate',
     actionName: 'turn',
-    gain: 1.0,
+    gain: 20.0,
+    smoothing: 0.3,
   })
 
   // Build creature interface
@@ -181,6 +185,16 @@ export function createRandomWorm(id: string, options: CreatureOptions = {}): Cre
     ['turn', turnMotor],
   ])
 
+  // ============================================================================
+  // CACHED TONIC DRIVE ARRAYS (avoid creating new Metal buffers every think()!)
+  // NOTE: We can cache DRIVE values but NOT indices (scatter-add corrupts them)
+  // ============================================================================
+  const aiySize = populationSize[aiyPop]
+  const aibSize = populationSize[aibPop]
+  const cachedAiyDrive = mx.full([aiySize], 12.0, mx.float32)
+  const cachedAibDrive = mx.full([aibSize], 3.0, mx.float32)
+  // NO cached indices - scatter-add corrupts them!
+
   let totalReward = 0
 
   function sense(stimuli: Map<string, number>): void {
@@ -191,7 +205,22 @@ export function createRandomWorm(id: string, options: CreatureOptions = {}): Cre
   }
 
   async function think(dt: number): Promise<void> {
+    // TONIC ACTIVITY: Same drive as innate worm for fair comparison
+    // The only difference should be the WIRING, not the drive to move
+    // NOTE: Drive values cached, but indices must be fresh (scatter-add bug)
+
+    // AIY gets strong tonic drive (moves forward by default)
+    injectCurrent(aiyPop, mx.arange(0, aiySize, 1, mx.int32), cachedAiyDrive)
+
+    // AIB gets weak tonic drive (occasional spontaneous turns)
+    injectCurrent(aibPop, mx.arange(0, aibSize, 1, mx.int32), cachedAibDrive)
+
     await step(networkIndex, dt)
+
+    // Update motor spike windows (needed for rate decoding)
+    for (const m of motorIndices) {
+      updateSpikeWindow(m)
+    }
   }
 
   function act(): Map<string, number> {

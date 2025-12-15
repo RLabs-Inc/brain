@@ -76,6 +76,98 @@ await mx.asyncEval(voltage, recovery)
 - No single-argument `where()` - must use `where(condition, x, y)`
 - Boolean mask indexing works: `array.index(boolMask)`
 
+### MLX Memory Management (CRITICAL!)
+
+MLX arrays are lazy-evaluated and each `mx.array()` allocates a Metal buffer. Without proper cleanup, long-running simulations exhaust GPU resources (~1.86GB before crash on M1 Max).
+
+**The Golden Rules:**
+
+1. **Cache constants at module level** - Never create the same array repeatedly:
+```typescript
+// GOOD - created once, reused forever
+const CONST_ZERO = mx.array(0, mx.float32)
+const CONST_ONE = mx.array(1, mx.float32)
+const CONST_EPSILON = mx.array(1e-8, mx.float32)
+
+// BAD - creates new Metal buffer every call!
+function compute() {
+  const zero = mx.array(0, mx.float32)  // LEAK!
+}
+```
+
+2. **Cache arrays used in hot loops** - Especially in `think()` or per-timestep functions:
+```typescript
+// GOOD - cache at creature creation
+const cachedDrive = mx.full([size], 12.0, mx.float32)
+const cachedIndices = mx.arange(0, size, 1, mx.int32)
+
+function think() {
+  injectCurrent(pop, cachedIndices, cachedDrive)  // Reuse!
+}
+
+// BAD - creates 4 GPU arrays every timestep!
+function think() {
+  const drive = mx.full([size], 12.0, mx.float32)  // LEAK!
+  injectCurrent(pop, mx.arange(0, size, 1, mx.int32), drive)  // LEAK!
+}
+```
+
+3. **Wrap computations in mx.tidy()** - Cleans up intermediate tensors:
+```typescript
+// GOOD - intermediates cleaned up automatically
+const result = mx.tidy(() => {
+  const a = mx.multiply(x, y)       // intermediate - cleaned
+  const b = mx.add(a, z)            // intermediate - cleaned
+  const c = mx.divide(b, scale)     // intermediate - cleaned
+  mx.eval(c)                        // IMPORTANT: eval INSIDE tidy!
+  return c                          // returned - NOT cleaned (we need it)
+})
+
+// BAD - all intermediates leak!
+const a = mx.multiply(x, y)         // LEAK!
+const b = mx.add(a, z)              // LEAK!
+const c = mx.divide(b, scale)       // LEAK!
+```
+
+4. **mx.eval() MUST be inside tidy** - Or you get "Cannot access stream on invalid event":
+```typescript
+// GOOD
+const result = mx.tidy(() => {
+  const computed = mx.add(x, y)
+  mx.eval(computed)  // Inside tidy!
+  return computed
+})
+
+// BAD - will error!
+const result = mx.tidy(() => {
+  return mx.add(x, y)
+})
+mx.eval(result)  // Error: invalid event
+```
+
+5. **State updates happen OUTSIDE tidy** - Return values, then assign:
+```typescript
+// GOOD
+const result = mx.tidy(() => {
+  const newValue = mx.add(state[i], delta)
+  mx.eval(newValue)
+  return newValue
+})
+state[i] = result  // Update outside
+
+// BAD - modifying state inside tidy can cause issues
+mx.tidy(() => {
+  state[i] = mx.add(state[i], delta)  // Risky!
+})
+```
+
+**Memory Leak Checklist:**
+- [ ] All constants cached at module top level?
+- [ ] Hot-loop arrays (think, sense, act) cached at creation time?
+- [ ] All GPU computation paths wrapped in mx.tidy()?
+- [ ] mx.eval() called INSIDE tidy blocks?
+- [ ] State assignments happen OUTSIDE tidy?
+
 ## Philosophy
 
 - **Don't innovate, implement**: Faithfully simulate biology (Izhikevich model, STDP)

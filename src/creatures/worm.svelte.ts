@@ -75,6 +75,7 @@ import {
   allocateMotor,
   releaseMotor,
   decodeAction,
+  updateSpikeWindow,
   motorRegistry,
 } from '../core/motor.svelte.ts'
 
@@ -173,6 +174,11 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
   const chemicalLeftPop = allocatePopulation(`${id}_chemical_left`, config.chemicalLeftSize, 'RS')
   const chemicalRightPop = allocatePopulation(`${id}_chemical_right`, config.chemicalRightSize, 'RS')
 
+  // KLINOKINESIS sensors - temporal comparison "am I getting warmer?"
+  // This is THE KEY to real chemotaxis!
+  const gettingWarmerPop = allocatePopulation(`${id}_getting_warmer`, config.chemicalLeftSize, 'RS')
+  const gettingColderPop = allocatePopulation(`${id}_getting_colder`, config.chemicalLeftSize, 'RS')
+
   // --- Interneuron Populations ---
   // AIB-like: turn promoter (excitatory type for output)
   const aibPop = allocatePopulation(`${id}_aib`, config.aibSize, 'RS')
@@ -184,7 +190,12 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
   const turnPop = allocatePopulation(`${id}_turn`, config.turnSize, 'RS')
 
   // Add all populations to network
-  const allPops = [chemicalLeftPop, chemicalRightPop, aibPop, aiyPop, forwardPop, turnPop]
+  const allPops = [
+    chemicalLeftPop, chemicalRightPop,
+    gettingWarmerPop, gettingColderPop,  // Klinokinesis sensors
+    aibPop, aiyPop,
+    forwardPop, turnPop
+  ]
   for (const pop of allPops) {
     addPopulationToNetwork(networkIndex, pop)
   }
@@ -228,13 +239,22 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
   }
 
   // --- Sensory → Interneuron connections ---
-  // Chemical sensors excite AIB (turn promoter)
-  const chemLeftToAib = createConnection('chem_left_aib', chemicalLeftPop, aibPop, config.chemicalToAib)
-  const chemRightToAib = createConnection('chem_right_aib', chemicalRightPop, aibPop, config.chemicalToAib)
+  // Chemical sensors provide weak local search (secondary to klinokinesis)
+  const chemLeftToAib = createConnection('chem_left_aib', chemicalLeftPop, aibPop, config.chemicalToAib * 0.3)  // Weakened
+  const chemRightToAib = createConnection('chem_right_aib', chemicalRightPop, aibPop, config.chemicalToAib * 0.3)
 
-  // Chemical sensors inhibit AIY (suppress forward when food detected)
-  const chemLeftToAiy = createConnection('chem_left_aiy', chemicalLeftPop, aiyPop, config.chemicalToAiy)
-  const chemRightToAiy = createConnection('chem_right_aiy', chemicalRightPop, aiyPop, config.chemicalToAiy)
+  // KLINOKINESIS - THE KEY TO REAL CHEMOTAXIS!
+  // "Getting colder" (concentration decreasing) → TURN MORE
+  // This is the biological algorithm: if you're going the wrong way, change direction!
+  const colderToAib = createConnection('colder_to_aib', gettingColderPop, aibPop, 0.8)  // Strong: turn when wrong!
+
+  // "Getting warmer" (concentration increasing) → GO STRAIGHT
+  // If you're going the right way, keep going!
+  const warmerToAiy = createConnection('warmer_to_aiy', gettingWarmerPop, aiyPop, 0.8)  // Strong: forward when right!
+
+  // Chemical sensors inhibit AIY (suppress forward when food detected - local search)
+  const chemLeftToAiy = createConnection('chem_left_aiy', chemicalLeftPop, aiyPop, config.chemicalToAiy * 0.3)  // Weakened
+  const chemRightToAiy = createConnection('chem_right_aiy', chemicalRightPop, aiyPop, config.chemicalToAiy * 0.3)
 
   // --- Interneuron → Motor connections ---
   // AIB excites turn motor
@@ -251,6 +271,7 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
   // Add all synapse groups to network
   const allSynapses = [
     chemLeftToAib, chemRightToAib, chemLeftToAiy, chemRightToAiy,
+    colderToAib, warmerToAiy,  // KLINOKINESIS connections
     aibToTurn, aiyToForward, aibToAiy, aiyToAib
   ]
   for (const syn of allSynapses) {
@@ -274,19 +295,37 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
     gain: 15.0,
   })
 
+  // KLINOKINESIS SENSORS - the key to real chemotaxis!
+  const gettingWarmerSensor = allocateSensor(`${id}_sensor_warmer`, gettingWarmerPop, {
+    type: 'chemical',
+    encoding: 'rate',
+    gain: 20.0,  // Strong response to temporal changes
+  })
+
+  const gettingColderSensor = allocateSensor(`${id}_sensor_colder`, gettingColderPop, {
+    type: 'chemical',
+    encoding: 'rate',
+    gain: 20.0,  // Strong response to temporal changes
+  })
+
   // Motors
+  // Gain increased and smoothing reduced for responsive movement
+  // With rate coding over 20-step window, raw output is ~0.01-0.05
+  // Need gain ~50-100 to produce meaningful movement (0.5-5 units/step)
   const forwardMotor = allocateMotor(`${id}_motor_forward`, forwardPop, {
     type: 'locomotion',
     decoding: 'rate',
     actionName: 'forward',
-    gain: 1.0,
+    gain: 50.0,       // Amplify small rate outputs to meaningful movement
+    smoothing: 0.3,   // Faster response (70% of new signal, 30% of old)
   })
 
   const turnMotor = allocateMotor(`${id}_motor_turn`, turnPop, {
     type: 'locomotion',
     decoding: 'rate',
     actionName: 'turn',
-    gain: 1.0,
+    gain: 20.0,       // Turning doesn't need as much gain
+    smoothing: 0.3,
   })
 
   // ============================================================================
@@ -295,22 +334,39 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
 
   const populationIndices = allPops
   const synapseGroupIndices = allSynapses
-  const sensorIndices = [chemicalLeftSensor, chemicalRightSensor]
+  const sensorIndices = [chemicalLeftSensor, chemicalRightSensor, gettingWarmerSensor, gettingColderSensor]
   const motorIndices = [forwardMotor, turnMotor]
 
   // Named maps for semantic access
   const populations = new Map<string, number>([
     ['chemical_left', chemicalLeftPop],
     ['chemical_right', chemicalRightPop],
+    ['getting_warmer', gettingWarmerPop],
+    ['getting_colder', gettingColderPop],
     ['aib', aibPop],
     ['aiy', aiyPop],
     ['forward', forwardPop],
     ['turn', turnPop],
   ])
 
+  // ============================================================================
+  // CACHED TONIC DRIVE ARRAYS (avoid creating new Metal buffers every think()!)
+  // These are the "primal drive" currents - created once, reused forever
+  // NOTE: We can cache the DRIVE values but NOT the indices!
+  // The scatter-add bug (array.at(indices).add(values)) corrupts index arrays
+  // after first use, so indices must be created fresh each call.
+  // ============================================================================
+  const aiySize = populationSize[aiyPop]
+  const aibSize = populationSize[aibPop]
+  const cachedAiyDrive = mx.full([aiySize], 12.0, mx.float32)  // Strong tonic drive
+  const cachedAibDrive = mx.full([aibSize], 3.0, mx.float32)   // Weak tonic drive
+  // NO cached indices - scatter-add corrupts them!
+
   const sensors = new Map<string, number>([
     ['chemical_left', chemicalLeftSensor],
     ['chemical_right', chemicalRightSensor],
+    ['getting_warmer', gettingWarmerSensor],
+    ['getting_colder', gettingColderSensor],
   ])
 
   const motors = new Map<string, number>([
@@ -330,14 +386,43 @@ export function createWorm(id: string, options: CreatureOptions = {}): Creature 
     const chemLeft = stimuli.get('chemical_left') ?? stimuli.get('chemical') ?? 0
     const chemRight = stimuli.get('chemical_right') ?? stimuli.get('chemical') ?? 0
 
+    // KLINOKINESIS - temporal comparison signals
+    // These are THE KEY to real chemotaxis!
+    const gettingWarmer = stimuli.get('concentration_increasing') ?? 0
+    const gettingColder = stimuli.get('concentration_decreasing') ?? 0
+
     // Send to sensory populations
     sendInput(chemicalLeftSensor, chemLeft)
     sendInput(chemicalRightSensor, chemRight)
+    sendInput(gettingWarmerSensor, gettingWarmer)
+    sendInput(gettingColderSensor, gettingColder)
   }
 
   async function think(dt: number): Promise<void> {
+    // TONIC ACTIVITY: The "primal drive to explore"
+    // In biology, AIY has baseline firing that drives forward movement.
+    // This represents the innate survival instinct - always be moving, searching.
+    // Without this, the worm would have no motivation to move at all!
+    //
+    // Inject constant current to AIY (forward drive) and small amount to AIB
+    // This creates the baseline behavior: move forward, occasionally turn
+    //
+    // NOTE: Drive VALUES are cached, but INDICES must be created fresh each call
+    // because scatter-add (array.at(indices).add(values)) corrupts index arrays!
+
+    // AIY gets strong tonic drive (moves forward by default)
+    injectCurrent(aiyPop, mx.arange(0, aiySize, 1, mx.int32), cachedAiyDrive)
+
+    // AIB gets weak tonic drive (occasional spontaneous turns)
+    injectCurrent(aibPop, mx.arange(0, aibSize, 1, mx.int32), cachedAibDrive)
+
     // Run one network step
     await step(networkIndex, dt)
+
+    // Update motor spike windows (needed for rate decoding)
+    for (const motorIndex of motorIndices) {
+      updateSpikeWindow(motorIndex)
+    }
   }
 
   function act(): Map<string, number> {

@@ -20,9 +20,17 @@ import { core as mx } from '@frost-beta/mlx'
 import { SvelteMap } from 'svelte/reactivity'
 import {
   injectCurrent,
+  injectUniformCurrent,
   populationSize,
   voltage,
 } from './neuron.svelte.ts'
+
+// ============================================================================
+// CACHED CONSTANTS (avoid creating new Metal buffers every call!)
+// ============================================================================
+
+const CONST_ZERO = mx.array(0, mx.float32)
+const CONST_ONE = mx.array(1, mx.float32)
 
 // ============================================================================
 // SENSORY TYPES
@@ -194,48 +202,56 @@ export function encodeRate(
   const popIndex = sensorPopulationIndex[sensorIndex]
   const size = populationSize[popIndex]
 
-  // Convert stimulus to GPU
-  const stimArray = mx.array(stimulus, mx.float32)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Convert stimulus to GPU
+    const stimArray = mx.array(stimulus, mx.float32)
 
-  // Apply threshold
-  const thresholded = mx.maximum(
-    mx.subtract(stimArray, sensorThreshold[sensorIndex]),
-    mx.array(0, mx.float32)
-  )
-
-  // Scale by gain
-  const scaled = mx.multiply(sensorGain[sensorIndex], thresholded)
-
-  // Apply adaptation if enabled
-  // For rate coding, use mean adaptation (all neurons get same stimulus level)
-  let effective = scaled
-  if (applyAdaptation) {
-    // Adaptation reduces response: effective = scaled * (1 - mean_adaptation)
-    const meanAdaptation = mx.mean(adaptationLevel[sensorIndex])
-    effective = mx.multiply(
-      scaled,
-      mx.subtract(mx.array(1, mx.float32), meanAdaptation)
+    // Apply threshold - use cached constants!
+    const thresholded = mx.maximum(
+      mx.subtract(stimArray, sensorThreshold[sensorIndex]),
+      CONST_ZERO
     )
 
-    // Update adaptation: increases with stimulus, decays without
-    const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], scaled)
-    const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
-    adaptationLevel[sensorIndex] = mx.clip(
-      mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
-      mx.array(0, mx.float32),
-      mx.array(1, mx.float32)
-    )
+    // Scale by gain
+    const scaled = mx.multiply(sensorGain[sensorIndex], thresholded)
+
+    // Apply adaptation if enabled
+    let effective = scaled
+    let newAdaptation = adaptationLevel[sensorIndex]
+
+    if (applyAdaptation) {
+      // Adaptation reduces response: effective = scaled * (1 - mean_adaptation)
+      const meanAdaptation = mx.mean(adaptationLevel[sensorIndex])
+      effective = mx.multiply(
+        scaled,
+        mx.subtract(CONST_ONE, meanAdaptation)
+      )
+
+      // Update adaptation: increases with stimulus, decays without
+      const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], scaled)
+      const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
+      newAdaptation = mx.clip(
+        mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
+        CONST_ZERO,
+        CONST_ONE
+      )
+    }
+
+    // Add baseline and broadcast to all neurons
+    const currentValue = mx.add(sensorBaseline[sensorIndex], effective)
+
+    mx.eval(currentValue, newAdaptation)
+    return { currentValue, newAdaptation, didAdapt: applyAdaptation }
+  })
+
+  // Update adaptation if enabled
+  if (result.didAdapt) {
+    adaptationLevel[sensorIndex] = result.newAdaptation
   }
 
-  // Add baseline and broadcast to all neurons
-  mx.eval(effective)
-  const currentValue = mx.add(sensorBaseline[sensorIndex], effective)
-  mx.eval(currentValue)
-  const fullCurrent = mx.full([size], currentValue.item(), mx.float32)
-
-  // Inject into population
-  const indices = mx.arange(0, size, 1, mx.int32)
-  injectCurrent(popIndex, indices, fullCurrent)
+  // Broadcast to all neurons - use uniform injection (no array allocation!)
+  injectUniformCurrent(popIndex, result.currentValue.item())
 }
 
 /**
@@ -253,42 +269,51 @@ export function encodePopulation(
   const popIndex = sensorPopulationIndex[sensorIndex]
   const size = populationSize[popIndex]
 
-  // Convert stimulus to GPU
-  const stimArray = mx.array(stimulus, mx.float32)
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Convert stimulus to GPU
+    const stimArray = mx.array(stimulus, mx.float32)
 
-  // Calculate distance from each neuron's preferred value
-  const centers = receptiveFieldCenter[sensorIndex]
-  const widths = receptiveFieldWidth[sensorIndex]
+    // Calculate distance from each neuron's preferred value
+    const centers = receptiveFieldCenter[sensorIndex]
+    const widths = receptiveFieldWidth[sensorIndex]
 
-  // Gaussian tuning curve: response = gain * exp(-((stim - center) / width)^2)
-  const distance = mx.subtract(stimArray, centers)
-  const normalizedDist = mx.divide(distance, widths)
-  const response = mx.multiply(
-    sensorGain[sensorIndex],
-    mx.exp(mx.negative(mx.square(normalizedDist)))
-  )
+    // Gaussian tuning curve: response = gain * exp(-((stim - center) / width)^2)
+    const distance = mx.subtract(stimArray, centers)
+    const normalizedDist = mx.divide(distance, widths)
+    const response = mx.multiply(
+      sensorGain[sensorIndex],
+      mx.exp(mx.negative(mx.square(normalizedDist)))
+    )
 
-  // Apply adaptation
-  const adapted = mx.multiply(
-    response,
-    mx.subtract(mx.array(1, mx.float32), adaptationLevel[sensorIndex])
-  )
+    // Apply adaptation - use cached constants!
+    const adapted = mx.multiply(
+      response,
+      mx.subtract(CONST_ONE, adaptationLevel[sensorIndex])
+    )
 
-  // Update adaptation (per neuron based on their response)
-  const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], response)
-  const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
-  adaptationLevel[sensorIndex] = mx.clip(
-    mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
-    mx.array(0, mx.float32),
-    mx.array(1, mx.float32)
-  )
+    // Update adaptation (per neuron based on their response)
+    const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], response)
+    const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
+    const newAdaptation = mx.clip(
+      mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
+      CONST_ZERO,
+      CONST_ONE
+    )
 
-  // Add baseline
-  const current = mx.add(sensorBaseline[sensorIndex], adapted)
+    // Add baseline
+    const current = mx.add(sensorBaseline[sensorIndex], adapted)
 
-  // Inject into population
-  const indices = mx.arange(0, size, 1, mx.int32)
-  injectCurrent(popIndex, indices, current)
+    // Indices for injection
+    const indices = mx.arange(0, size, 1, mx.int32)
+
+    mx.eval(current, newAdaptation, indices)
+    return { current, newAdaptation, indices }
+  })
+
+  // Update state and inject (outside tidy)
+  adaptationLevel[sensorIndex] = result.newAdaptation
+  injectCurrent(popIndex, result.indices, result.current)
 }
 
 /**
@@ -312,36 +337,45 @@ export function encodePlace(
     throw new Error(`Stimulus size ${stimulus.shape[0]} doesn't match population size ${size}`)
   }
 
-  // Apply threshold
-  const thresholded = mx.maximum(
-    mx.subtract(stimulus, sensorThreshold[sensorIndex]),
-    mx.zeros([size], mx.float32)
-  )
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Apply threshold
+    const thresholded = mx.maximum(
+      mx.subtract(stimulus, sensorThreshold[sensorIndex]),
+      mx.zeros([size], mx.float32)
+    )
 
-  // Scale by gain
-  const scaled = mx.multiply(sensorGain[sensorIndex], thresholded)
+    // Scale by gain
+    const scaled = mx.multiply(sensorGain[sensorIndex], thresholded)
 
-  // Apply adaptation
-  const adapted = mx.multiply(
-    scaled,
-    mx.subtract(mx.array(1, mx.float32), adaptationLevel[sensorIndex])
-  )
+    // Apply adaptation - use cached constants!
+    const adapted = mx.multiply(
+      scaled,
+      mx.subtract(CONST_ONE, adaptationLevel[sensorIndex])
+    )
 
-  // Update adaptation
-  const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], scaled)
-  const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
-  adaptationLevel[sensorIndex] = mx.clip(
-    mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
-    mx.array(0, mx.float32),
-    mx.array(1, mx.float32)
-  )
+    // Update adaptation
+    const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], scaled)
+    const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
+    const newAdaptation = mx.clip(
+      mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
+      CONST_ZERO,
+      CONST_ONE
+    )
 
-  // Add baseline
-  const current = mx.add(sensorBaseline[sensorIndex], adapted)
+    // Add baseline
+    const current = mx.add(sensorBaseline[sensorIndex], adapted)
 
-  // Inject into population
-  const indices = mx.arange(0, size, 1, mx.int32)
-  injectCurrent(popIndex, indices, current)
+    // Indices for injection
+    const indices = mx.arange(0, size, 1, mx.int32)
+
+    mx.eval(current, newAdaptation, indices)
+    return { current, newAdaptation, indices }
+  })
+
+  // Update state and inject (outside tidy)
+  adaptationLevel[sensorIndex] = result.newAdaptation
+  injectCurrent(popIndex, result.indices, result.current)
 }
 
 /**
@@ -362,23 +396,33 @@ export function encodeBinary(
   const popIndex = sensorPopulationIndex[sensorIndex]
   const size = populationSize[popIndex]
 
-  // Apply adaptation
-  const adaptedMag = magnitude * (1 - mx.mean(adaptationLevel[sensorIndex]).item())
+  // Use mx.tidy to clean up intermediate tensors
+  const result = mx.tidy(() => {
+    // Get mean adaptation (need to eval before .item())
+    const meanAdapt = mx.mean(adaptationLevel[sensorIndex])
+    mx.eval(meanAdapt)
+    const adaptedMag = magnitude * (1 - meanAdapt.item())
 
-  // Update adaptation
-  if (on) {
-    const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], mx.array(magnitude, mx.float32))
+    // Update adaptation - use cached constants!
+    const magArray = mx.array(magnitude, mx.float32)
+    const adaptIncrease = mx.multiply(adaptationRate[sensorIndex], magArray)
     const adaptDecrease = mx.multiply(adaptationRecovery[sensorIndex], adaptationLevel[sensorIndex])
-    adaptationLevel[sensorIndex] = mx.clip(
+    const newAdaptation = mx.clip(
       mx.add(mx.subtract(adaptationLevel[sensorIndex], adaptDecrease), adaptIncrease),
-      mx.array(0, mx.float32),
-      mx.array(1, mx.float32)
+      CONST_ZERO,
+      CONST_ONE
     )
-  }
 
-  const current = mx.full([size], adaptedMag, mx.float32)
-  const indices = mx.arange(0, size, 1, mx.int32)
-  injectCurrent(popIndex, indices, current)
+    const current = mx.full([size], adaptedMag, mx.float32)
+    const indices = mx.arange(0, size, 1, mx.int32)
+
+    mx.eval(current, newAdaptation, indices)
+    return { current, newAdaptation, indices }
+  })
+
+  // Update state and inject (outside tidy)
+  adaptationLevel[sensorIndex] = result.newAdaptation
+  injectCurrent(popIndex, result.indices, result.current)
 }
 
 // ============================================================================
