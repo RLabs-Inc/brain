@@ -325,14 +325,17 @@ export function decodeRate(motorIndex: number): ReturnType<typeof mx.array> {
     return output
   })
 
-  // Apply smoothing (outside tidy since we need state)
+  // Apply smoothing - wrap in tidy to clean up intermediate arrays!
   const smoothing = outputSmoothing[motorIndex].item()
   if (smoothing > 0) {
-    const smoothed = mx.add(
-      mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
-      mx.multiply(mx.array(1 - smoothing, mx.float32), result)
-    )
-    mx.eval(smoothed)
+    const smoothed = mx.tidy(() => {
+      const s = mx.add(
+        mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
+        mx.multiply(mx.array(1 - smoothing, mx.float32), result)
+      )
+      mx.eval(s)
+      return s
+    })
     lastOutput[motorIndex] = smoothed
     return smoothed
   }
@@ -382,14 +385,17 @@ export function decodePopulation(
     return output
   })
 
-  // Apply smoothing (outside tidy since we need state)
+  // Apply smoothing - wrap in tidy to clean up intermediate arrays!
   const smoothing = outputSmoothing[motorIndex].item()
   if (smoothing > 0) {
-    const smoothed = mx.add(
-      mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
-      mx.multiply(mx.array(1 - smoothing, mx.float32), result)
-    )
-    mx.eval(smoothed)
+    const smoothed = mx.tidy(() => {
+      const s = mx.add(
+        mx.multiply(mx.array(smoothing, mx.float32), lastOutput[motorIndex]),
+        mx.multiply(mx.array(1 - smoothing, mx.float32), result)
+      )
+      mx.eval(s)
+      return s
+    })
     lastOutput[motorIndex] = smoothed
     return smoothed
   }
