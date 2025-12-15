@@ -449,6 +449,44 @@ export function decodeLabeledLine(motorIndex: number): ReturnType<typeof mx.arra
 }
 
 // ============================================================================
+// GENERIC DECODE (dispatches to specific decoder)
+// ============================================================================
+
+/**
+ * Decode motor output based on motor's configured decoding type.
+ * This is the main entry point for reading motor output.
+ *
+ * @param motorIndex - Which motor to decode
+ * @returns JS number - the action magnitude (converts from GPU)
+ */
+export function decodeAction(motorIndex: number): number {
+  const decoding = motorDecoding[motorIndex]
+
+  let gpuValue: ReturnType<typeof mx.array>
+
+  switch (decoding) {
+    case 'rate':
+      gpuValue = decodeRate(motorIndex)
+      break
+    case 'winner_take_all':
+      gpuValue = decodeWinnerTakeAll(motorIndex)
+      break
+    case 'labeled_line':
+      gpuValue = decodeLabeledLine(motorIndex)
+      break
+    case 'population':
+      // Population coding needs preferred values - use rate as fallback
+      gpuValue = decodeRate(motorIndex)
+      break
+    default:
+      gpuValue = decodeRate(motorIndex)
+  }
+
+  // Convert GPU scalar to JS number
+  return gpuValue.item() as number
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 

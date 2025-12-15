@@ -382,6 +382,39 @@ export function encodeBinary(
 }
 
 // ============================================================================
+// GENERIC SEND INPUT (dispatches to specific encoder)
+// ============================================================================
+
+/**
+ * Send input to a sensor based on its configured encoding type.
+ * This is the main entry point for providing sensory input.
+ *
+ * @param sensorIndex - Which sensor to stimulate
+ * @param stimulus - Scalar stimulus value (typically 0-1)
+ */
+export function sendInput(sensorIndex: number, stimulus: number): void {
+  const encoding = sensorEncoding[sensorIndex]
+
+  switch (encoding) {
+    case 'rate':
+      encodeRate(sensorIndex, stimulus)
+      break
+    case 'population':
+      encodePopulation(sensorIndex, stimulus)
+      break
+    case 'place':
+      encodePlace(sensorIndex, stimulus)
+      break
+    case 'temporal':
+      // Temporal encoding uses binary with timing
+      encodeBinary(sensorIndex, stimulus > 0.5)
+      break
+    default:
+      encodeRate(sensorIndex, stimulus)
+  }
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
